@@ -1452,12 +1452,16 @@ fn non_openai_tools_rewrite_custom_apply_patch() {
     assert_eq!(value[1]["type"], "function");
     assert_eq!(value[1]["name"], "apply_patch");
     assert_eq!(value[1].get("format"), None);
-    assert_eq!(value[1]["parameters"]["required"][0], "input");
+    assert_eq!(value[1]["parameters"].get("required"), None);
+    assert_eq!(
+        value[1]["parameters"]["properties"]["operation"]["enum"],
+        serde_json::json!(["create_file", "update_file", "delete_file"])
+    );
     assert!(
         value[1]["description"]
             .as_str()
             .unwrap()
-            .contains("`input` argument")
+            .contains("structured fields")
     );
     assert_eq!(value[2]["type"], "function");
     assert_eq!(value[2]["name"], "other_custom");

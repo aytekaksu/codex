@@ -129,6 +129,9 @@ use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::tools::apply_patch_function::APPLY_PATCH_TOOL_NAME;
+use crate::tools::apply_patch_function::apply_patch_function_description;
+use crate::tools::apply_patch_function::apply_patch_function_parameters;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -2929,15 +2932,14 @@ fn apply_meta_tool_name_guards(value: &mut serde_json::Value, has_web_search: bo
     match value {
         serde_json::Value::Object(map) => {
             let mut changed = false;
-            if map.get("type").and_then(serde_json::Value::as_str) == Some("function") {
-                if let Some(serde_json::Value::String(name)) = map.get_mut("name") {
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("function")
+                && let Some(serde_json::Value::String(name)) = map.get_mut("name") {
                     if has_web_search && META_RESERVED_BROWSER_TOOL_NAMES.contains(&name.as_str()) {
                         name.push_str("_tool");
                         changed = true;
                     }
                     changed |= collapse_extra_dots_in_tool_name(name);
                 }
-            }
             for child in map.values_mut() {
                 changed |= apply_meta_tool_name_guards(child, has_web_search);
             }
@@ -3002,6 +3004,19 @@ fn convert_custom_tool_to_function(value: &mut serde_json::Value) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if name == APPLY_PATCH_TOOL_NAME {
+        let description = apply_patch_function_description(
+            value.get("description").and_then(serde_json::Value::as_str),
+        );
+        *value = serde_json::json!({
+            "type": "function",
+            "name": name,
+            "description": description,
+            "strict": false,
+            "parameters": apply_patch_function_parameters(),
+        });
+        return;
+    }
     let description = match value.get("description").and_then(serde_json::Value::as_str) {
         Some(text) if !text.is_empty() => {
             format!("{text} Pass the freeform text in the `input` argument.")
@@ -3031,12 +3046,11 @@ fn truncate_json_tool_names(value: &mut serde_json::Value) -> bool {
     let mut changed = false;
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(name)) = map.get_mut("name") {
-                if name.chars().count() > META_TOOL_NAME_MAX_CHARS {
+            if let Some(serde_json::Value::String(name)) = map.get_mut("name")
+                && name.chars().count() > META_TOOL_NAME_MAX_CHARS {
                     *name = name.chars().take(META_TOOL_NAME_MAX_CHARS).collect();
                     changed = true;
                 }
-            }
             for child in map.values_mut() {
                 changed |= truncate_json_tool_names(child);
             }

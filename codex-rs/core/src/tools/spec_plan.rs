@@ -40,6 +40,8 @@ use crate::tools::handlers::multi_agents::WaitAgentHandler;
 use crate::tools::handlers::multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents_common::MUSE_SPARK_ROLE;
+use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
@@ -627,6 +629,19 @@ fn hosted_model_tool_specs(
 
 pub(crate) fn search_tool_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
     model_info.supports_search_tool && namespace_tools_enabled(turn_context)
+}
+
+fn muse_spark_session(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
+    looks_like_muse_spark_name(&model_info.slug)
+        || turn_context
+            .session_source
+            .get_agent_role()
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case(MUSE_SPARK_ROLE))
+        || turn_context
+            .session_source
+            .get_agent_path()
+            .is_some_and(|path| looks_like_muse_spark_name(path.name()))
 }
 
 pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
@@ -1236,7 +1251,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         ));
     }
 
-    if environment_mode.has_environment() && context.model_info.apply_patch_tool_type.is_some() {
+    if environment_mode.has_environment()
+        && (context.model_info.apply_patch_tool_type.is_some()
+            || muse_spark_session(turn_context, context.model_info))
+    {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         registry.add(ApplyPatchHandler::new(include_environment_id));
     }

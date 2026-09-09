@@ -86,9 +86,9 @@ async fn apply_role_to_config_inner(
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
-        model_provider: role_config.model_provider.filter(|provider_id| {
-            config.model_providers.contains_key(provider_id)
-        }),
+        model_provider: role_config
+            .model_provider
+            .filter(|provider_id| config.model_providers.contains_key(provider_id)),
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
         model_verbosity: role_config.model_verbosity,

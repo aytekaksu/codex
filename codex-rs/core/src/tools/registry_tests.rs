@@ -2,6 +2,7 @@ use super::*;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::TruncationPolicy;
 use futures::future::BoxFuture;
@@ -750,7 +751,7 @@ async fn dispatch_rewrites_function_input_for_custom_only_handlers() -> anyhow::
         arguments: serde_json::json!({ "input": "freeform text" }).to_string(),
     };
 
-    registry
+    let result = registry
         .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
         .await?;
 
@@ -760,6 +761,13 @@ async fn dispatch_rewrites_function_input_for_custom_only_handlers() -> anyhow::
             .as_deref(),
         Some("freeform text")
     );
+    assert!(matches!(result.payload, ToolPayload::Function { .. }));
+    assert!(matches!(
+        result
+            .result
+            .to_response_item(&result.call_id, &result.payload),
+        ResponseInputItem::FunctionCallOutput { .. }
+    ));
     Ok(())
 }
 
