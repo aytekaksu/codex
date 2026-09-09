@@ -314,14 +314,14 @@ fn baked_personality_section_is_preserved_without_enabled_explicit_none() {
 }
 
 #[test]
-fn muse_spark_fallback_enables_apply_patch() {
+fn muse_spark_fallback_enables_apply_patch_and_search() {
     let model = model_info_from_slug("muse-spark-1.3");
 
     assert_eq!(
         model.apply_patch_tool_type,
         Some(ApplyPatchToolType::Freeform)
     );
-    assert!(!model.supports_search_tool);
+    assert!(model.supports_search_tool);
     assert!(model.used_fallback_model_metadata);
 }
 

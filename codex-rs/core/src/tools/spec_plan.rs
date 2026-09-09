@@ -630,7 +630,8 @@ fn hosted_model_tool_specs(
 }
 
 pub(crate) fn search_tool_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
-    model_info.supports_search_tool && namespace_tools_enabled(turn_context)
+    (model_info.supports_search_tool || muse_spark_session(turn_context, model_info))
+        && namespace_tools_enabled(turn_context)
 }
 
 fn muse_spark_session(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {

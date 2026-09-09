@@ -1,8 +1,8 @@
 # Muse Spark on a ChatGPT parent
 
-This branch (`rust-v0.153.4-muse`, from tag `rust-v0.153.4`) lets a ChatGPT-authenticated Codex parent spawn a child role that talks to Meta Muse Spark through a local [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) instance. Default OpenAI / ChatGPT behavior is unchanged.
+This branch (`rust-v0.153.4-muse`, from tag `rust-v0.153.4`) lets a ChatGPT-authenticated Codex parent spawn a Muse Spark child through a local [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) instance. Default OpenAI / ChatGPT behavior is unchanged.
 
-Upstream Codex still ignores `model_provider` on agent roles ([openai/codex#40858](https://github.com/openai/codex/issues/40858)). This fork adds that override, rewrites encrypted `agent_message` / custom-tool items for non-OpenAI providers, and accepts `apply_patch` as a function call with an `input` string.
+The parent stays on ChatGPT and keeps encrypted `collaboration.*` for OpenAI children. Muse work goes through plaintext `external_agents.spawn_agent`, `external_agents.send_message`, and `external_agents.followup_task`. The child sees the exact `message` as user input. Do not use `fork_turns` for Muse, and do not ask the child to read an omitted encrypted payload from parent history.
 
 Machine-local files stay off this repo: no API keys, no `~/.cli-proxy-api/config.yaml`, no `~/.codex/config.toml`, no session logs.
 
@@ -29,7 +29,7 @@ Save as `~/.codex/agents/muse-spark.toml` (the role name is `muse_spark`):
 
 ```toml
 name = "muse_spark"
-description = "Cheap Muse Spark 1.3 worker via local CLIProxyAPI. Spawn with a task_name that starts with muse_. Never pass model=muse-spark-1.3. Avoid fork_turns=all; pass a positive integer of recent parent turns."
+description = "Cheap Muse Spark 1.3 worker via local CLIProxyAPI. Spawn with external_agents and a task_name that starts with muse_. Never pass model=muse-spark-1.3. Put the full task in plaintext message; do not fork parent history."
 nickname_candidates = ["Muse", "Spark"]
 model = "muse-spark-1.3"
 model_provider = "cliproxy"
@@ -38,29 +38,25 @@ model_reasoning_summary = "auto"
 model_context_window = 372000
 model_auto_compact_token_limit = 334800
 developer_instructions = """
-You are a Muse Spark 1.3 worker for a smarter parent agent. Do simple, concrete grunt work: search, list, read, tally, and report. Do not make architecture calls or claim the work is finished or verified. Return a self-contained result the parent can check.
+You are a Muse Spark 1.3 worker for a smarter parent agent. Do simple, concrete grunt work: search, list, read, tally, patch, and report. Do not make architecture calls or claim the work is finished or verified. Return a self-contained result the parent can check.
 
-If a task header says the encrypted payload was omitted, the assignment is in the parent conversation above that header. Follow those recent parent turns.
+The parent sends the full assignment as plaintext user input. Use only the tools listed in the current turn. apply_patch accepts structured create_file/update_file/delete_file fields or a canonical patch in input.
 """
-
-[features]
-apps = false
-plugins = false
-web_search_request = false
-web_search_cached = false
-standalone_web_search = false
 ```
 
-`model_provider` may only name a provider already defined on the parent (see above). Roles cannot invent endpoints.
+Leave hosted search enabled for this role. `model_provider` may only name a provider already defined on the parent. Roles cannot invent endpoints.
 
 ## How to spawn
 
-Use native multi-agent v2 `spawn_agent` with:
+Use `external_agents.spawn_agent` (not `collaboration.spawn_agent`):
 
 - `task_name` starting with `muse_` (for example `muse_inventory`). That prefix selects `muse_spark` and routes the child to `cliproxy`.
-- Do **not** pass `model=muse-spark-1.3`. That slug is not a ChatGPT model; the parent backend rejects it. This fork also drops that argument if it is sent.
-- Set `fork_turns` to a positive integer of recent parent turns. `fork_turns=all` (or omitting it) is capped to the last 30 turns for Muse.
-- Put the actual assignment in those recent parent turns as well as in the spawn message. ChatGPT encrypts the spawn `message`; the local provider cannot read it, so the forked parent context is the task.
+- Do **not** pass `model=muse-spark-1.3`. That slug is not a ChatGPT model; the parent backend rejects it.
+- Put the complete assignment in plaintext `message`. Muse does not inherit parent history (`fork_turns` is ignored / forced off).
+- After spawn, call one long `collaboration.wait_agent`, then one `collaboration.list_agents`. Inspect files and tests yourself. Child prose is not verification.
+- Later notes use `external_agents.send_message` or `external_agents.followup_task` with the same plaintext `message` contract.
+
+`collaboration.spawn_agent`, `collaboration.send_message`, and `collaboration.followup_task` targeting Muse return a model-visible error telling the parent to use `external_agents`.
 
 Tell the parent the same rules in `~/.codex/AGENTS.md` if you want it to spawn Muse without extra prompting.
 

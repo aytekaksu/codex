@@ -125,6 +125,8 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
+use crate::context::collect_wire_tool_names;
+use crate::context::upsert_muse_tool_guidance;
 use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -132,6 +134,7 @@ use crate::responses_metadata::subagent_header_value;
 use crate::tools::apply_patch_function::APPLY_PATCH_TOOL_NAME;
 use crate::tools::apply_patch_function::apply_patch_function_description;
 use crate::tools::apply_patch_function::apply_patch_function_parameters;
+use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -940,6 +943,7 @@ impl ModelClient {
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
         let is_openai = self.state.provider.info().is_openai();
+        let mut muse_tool_names = None;
         let (instructions, tools) = if model_info.use_responses_lite {
             // These prompt-only items are rebuilt on every request. Hash their visible payloads
             // within the thread so retries and resumed sessions preserve their identity.
@@ -976,6 +980,11 @@ impl ModelClient {
             let mut tools_raw = create_tools_raw_json_for_responses_api(&prompt.tools)?;
             if !is_openai {
                 tools_raw = sanitize_non_openai_tools(tools_raw);
+                if looks_like_muse_spark_name(&model_info.slug)
+                    && let Ok(value) = serde_json::from_str(tools_raw.get())
+                {
+                    muse_tool_names = Some(collect_wire_tool_names(&value));
+                }
             }
             (
                 prompt.base_instructions.text.clone(),
@@ -984,6 +993,9 @@ impl ModelClient {
         };
         if !is_openai {
             rewrite_non_openai_response_items(&mut input);
+            if let Some(names) = muse_tool_names.as_deref() {
+                upsert_muse_tool_guidance(&mut input, names);
+            }
         }
         let reasoning = self.build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
