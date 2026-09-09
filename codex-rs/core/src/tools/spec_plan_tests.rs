@@ -2841,6 +2841,47 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
 }
 
 #[tokio::test]
+async fn external_agents_message_schemas_are_plaintext() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("external_agents") else {
+        panic!("expected external_agents namespace");
+    };
+    assert_eq!(
+        plan.namespace_function_names("external_agents"),
+        &[
+            "followup_task".to_string(),
+            "send_message".to_string(),
+            "spawn_agent".to_string(),
+        ]
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(
+                tool,
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name
+            )
+        }) else {
+            panic!("expected {tool_name} in external_agents namespace");
+        };
+        let properties = tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("tool should use object params");
+        assert_eq!(
+            properties
+                .get("message")
+                .and_then(|schema| schema.encrypted),
+            None
+        );
+        assert!(tool.description.contains("plaintext"));
+    }
+}
+
+#[tokio::test]
 async fn multi_agent_v2_can_disable_wait_agent() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);

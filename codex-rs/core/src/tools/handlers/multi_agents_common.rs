@@ -26,6 +26,32 @@ use codex_protocol::user_input::UserInput;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
+/// Configured Muse Spark worker role. ChatGPT hides `agent_type`, so spawn
+/// also infers this from `task_name` / `model` slugs the parent is allowed to send.
+pub(crate) const MUSE_SPARK_ROLE: &str = "muse_spark";
+
+pub(crate) fn looks_like_muse_spark_name(value: &str) -> bool {
+    let lowered = value.trim().to_ascii_lowercase();
+    lowered.starts_with("muse_") || lowered.contains("muse-spark") || lowered.contains("muse_spark")
+}
+
+pub(crate) fn infer_muse_spark_role(
+    task_name: &str,
+    agent_type: Option<&str>,
+    model: Option<&str>,
+) -> Option<&'static str> {
+    if agent_type
+        .map(str::trim)
+        .is_some_and(|role| role.eq_ignore_ascii_case(MUSE_SPARK_ROLE))
+        || looks_like_muse_spark_name(task_name)
+        || model.is_some_and(looks_like_muse_spark_name)
+    {
+        Some(MUSE_SPARK_ROLE)
+    } else {
+        None
+    }
+}
+
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
@@ -436,4 +462,33 @@ fn validate_spawn_agent_reasoning_effort(
     Err(FunctionCallError::RespondToModel(format!(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
+}
+
+#[cfg(test)]
+mod muse_spark_role_tests {
+    use super::MUSE_SPARK_ROLE;
+    use super::infer_muse_spark_role;
+    use super::looks_like_muse_spark_name;
+
+    #[test]
+    fn infers_muse_spark_from_task_name_prefix() {
+        assert_eq!(
+            infer_muse_spark_role("muse_cli_probe", None, None),
+            Some(MUSE_SPARK_ROLE)
+        );
+        assert!(!looks_like_muse_spark_name("inventory"));
+        assert_eq!(infer_muse_spark_role("inventory", None, None), None);
+    }
+
+    #[test]
+    fn infers_muse_spark_from_hidden_agent_type_or_model_slug() {
+        assert_eq!(
+            infer_muse_spark_role("worker", Some("muse_spark"), None),
+            Some(MUSE_SPARK_ROLE)
+        );
+        assert_eq!(
+            infer_muse_spark_role("worker", None, Some("muse-spark-1.3")),
+            Some(MUSE_SPARK_ROLE)
+        );
+    }
 }

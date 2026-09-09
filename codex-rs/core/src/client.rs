@@ -81,6 +81,8 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -123,10 +125,16 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
+use crate::context::collect_wire_tool_names;
+use crate::context::upsert_muse_tool_guidance;
 use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::tools::apply_patch_function::APPLY_PATCH_TOOL_NAME;
+use crate::tools::apply_patch_function::apply_patch_function_description;
+use crate::tools::apply_patch_function::apply_patch_function_parameters;
+use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -935,6 +943,7 @@ impl ModelClient {
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
         let is_openai = self.state.provider.info().is_openai();
+        let mut muse_tool_names = None;
         let (instructions, tools) = if model_info.use_responses_lite {
             // These prompt-only items are rebuilt on every request. Hash their visible payloads
             // within the thread so retries and resumed sessions preserve their identity.
@@ -968,21 +977,24 @@ impl ModelClient {
             input.splice(0..0, prefix);
             (String::new(), None)
         } else {
+            let mut tools_raw = create_tools_raw_json_for_responses_api(&prompt.tools)?;
+            if !is_openai {
+                tools_raw = sanitize_non_openai_tools(tools_raw);
+                if looks_like_muse_spark_name(&model_info.slug)
+                    && let Ok(value) = serde_json::from_str(tools_raw.get())
+                {
+                    muse_tool_names = Some(collect_wire_tool_names(&value));
+                }
+            }
             (
                 prompt.base_instructions.text.clone(),
-                Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
+                Some(tools_raw.into()),
             )
         };
         if !is_openai {
-            for item in &mut input {
-                item.clear_internal_chat_message_metadata_passthrough();
-                if let ResponseItem::FunctionCall {
-                    encrypted_function_args,
-                    ..
-                } = item
-                {
-                    *encrypted_function_args = None;
-                }
+            rewrite_non_openai_response_items(&mut input);
+            if let Some(names) = muse_tool_names.as_deref() {
+                upsert_muse_tool_guidance(&mut input, names);
             }
         }
         let reasoning = self.build_reasoning(model_info, effort, summary);
@@ -1011,7 +1023,7 @@ impl ModelClient {
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
-        let request = ResponsesApiRequest {
+        let mut request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
             input,
@@ -1029,6 +1041,9 @@ impl ModelClient {
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
+        if !is_openai {
+            request.tool_choice = "auto".to_string();
+        }
         Ok(request)
     }
 
@@ -2726,6 +2741,340 @@ impl WebsocketTelemetry for ApiTelemetry {
         self.session_telemetry
             .record_websocket_event(result, duration);
     }
+}
+
+const META_TOOL_NAME_MAX_CHARS: usize = 64;
+
+fn rewrite_non_openai_response_items(input: &mut Vec<ResponseItem>) {
+    for item in input.iter_mut() {
+        item.clear_internal_chat_message_metadata_passthrough();
+        match item {
+            ResponseItem::FunctionCall {
+                encrypted_function_args,
+                name,
+                ..
+            } => {
+                *encrypted_function_args = None;
+                truncate_in_place(name, META_TOOL_NAME_MAX_CHARS);
+            }
+            ResponseItem::CustomToolCall { name, .. } => {
+                truncate_in_place(name, META_TOOL_NAME_MAX_CHARS);
+            }
+            _ => {}
+        }
+    }
+    for item in input.iter_mut() {
+        if matches!(item, ResponseItem::AgentMessage { .. }) {
+            *item = portable_agent_message(std::mem::replace(item, placeholder_user_message()));
+        } else if matches!(item, ResponseItem::CustomToolCall { .. }) {
+            *item = portable_custom_tool_call(std::mem::replace(item, placeholder_user_message()));
+        } else if matches!(item, ResponseItem::CustomToolCallOutput { .. }) {
+            *item = portable_custom_tool_call_output(std::mem::replace(
+                item,
+                placeholder_user_message(),
+            ));
+        }
+    }
+}
+
+fn placeholder_user_message() -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: Vec::new(),
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn portable_agent_message(item: ResponseItem) -> ResponseItem {
+    let ResponseItem::AgentMessage {
+        id,
+        author,
+        recipient,
+        content,
+        ..
+    } = item
+    else {
+        return item;
+    };
+
+    let mut text = String::new();
+    let mut omitted_encrypted = false;
+    for part in content {
+        match part {
+            AgentMessageInputContent::InputText { text: part } => text.push_str(&part),
+            AgentMessageInputContent::EncryptedContent { .. } => omitted_encrypted = true,
+        }
+    }
+    if omitted_encrypted {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "[encrypted inter-agent payload omitted; use the parent conversation and any plaintext headers above as the task]",
+        );
+    }
+    if text.trim().is_empty() {
+        text = format!("Inter-agent message from {author} to {recipient}.");
+    }
+
+    ResponseItem::Message {
+        id,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn portable_custom_tool_call(item: ResponseItem) -> ResponseItem {
+    let ResponseItem::CustomToolCall {
+        id,
+        call_id,
+        name,
+        namespace,
+        input,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = item
+    else {
+        return item;
+    };
+    ResponseItem::FunctionCall {
+        id,
+        name,
+        namespace,
+        arguments: serde_json::json!({ "input": input }).to_string(),
+        encrypted_function_args: None,
+        call_id,
+        internal_chat_message_metadata_passthrough,
+    }
+}
+
+fn portable_custom_tool_call_output(item: ResponseItem) -> ResponseItem {
+    let ResponseItem::CustomToolCallOutput {
+        id,
+        call_id,
+        name,
+        output,
+        internal_chat_message_metadata_passthrough,
+    } = item
+    else {
+        return item;
+    };
+    ResponseItem::FunctionCallOutput {
+        id,
+        call_id: Some(call_id),
+        name,
+        namespace: None,
+        output,
+        internal_chat_message_metadata_passthrough,
+    }
+}
+
+fn truncate_in_place(name: &mut String, max_chars: usize) {
+    if name.chars().count() > max_chars {
+        *name = name.chars().take(max_chars).collect();
+    }
+}
+
+fn sanitize_non_openai_tools(
+    tools: std::sync::Arc<serde_json::value::RawValue>,
+) -> std::sync::Arc<serde_json::value::RawValue> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(tools.get()) else {
+        return tools;
+    };
+    let has_web_search = json_contains_web_search(&value);
+    let changed = apply_meta_request_guards(&mut value)
+        | strip_non_openai_tool_fields(&mut value)
+        | apply_meta_tool_name_guards(&mut value, has_web_search)
+        | truncate_json_tool_names(&mut value);
+    if !changed {
+        return tools;
+    }
+    match serde_json::value::to_raw_value(&value) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(_) => tools,
+    }
+}
+
+const META_RESERVED_BROWSER_TOOL_NAMES: [&str; 3] =
+    ["browser.search", "browser.open", "browser.find"];
+
+fn json_contains_web_search(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
+                || map.values().any(json_contains_web_search)
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_contains_web_search),
+        _ => false,
+    }
+}
+
+fn apply_meta_request_guards(value: &mut serde_json::Value) -> bool {
+    let Some(map) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    match map.get("tool_choice") {
+        Some(serde_json::Value::String(choice)) if choice == "auto" => {}
+        Some(_) => {
+            map.insert(
+                "tool_choice".to_string(),
+                serde_json::Value::String("auto".to_string()),
+            );
+            changed = true;
+        }
+        None => {}
+    }
+    match map.get("truncation") {
+        Some(serde_json::Value::String(truncation)) if truncation == "disabled" => {}
+        Some(_) => {
+            map.remove("truncation");
+            changed = true;
+        }
+        None => {}
+    }
+    changed
+}
+
+fn apply_meta_tool_name_guards(value: &mut serde_json::Value, has_web_search: bool) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("function")
+                && let Some(serde_json::Value::String(name)) = map.get_mut("name") {
+                    if has_web_search && META_RESERVED_BROWSER_TOOL_NAMES.contains(&name.as_str()) {
+                        name.push_str("_tool");
+                        changed = true;
+                    }
+                    changed |= collapse_extra_dots_in_tool_name(name);
+                }
+            for child in map.values_mut() {
+                changed |= apply_meta_tool_name_guards(child, has_web_search);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for child in items {
+                changed |= apply_meta_tool_name_guards(child, has_web_search);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn collapse_extra_dots_in_tool_name(name: &mut String) -> bool {
+    let Some(first_dot) = name.find('.') else {
+        return false;
+    };
+    let (head, tail) = name.split_at(first_dot + 1);
+    if !tail.contains('.') {
+        return false;
+    }
+    let collapsed = tail.replace('.', "_");
+    *name = format!("{head}{collapsed}");
+    true
+}
+
+fn strip_non_openai_tool_fields(value: &mut serde_json::Value) -> bool {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("custom") {
+        convert_custom_tool_to_function(value);
+        return true;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
+                && map.remove("search_content_types").is_some()
+            {
+                changed = true;
+            }
+            for child in map.values_mut() {
+                changed |= strip_non_openai_tool_fields(child);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for child in items {
+                changed |= strip_non_openai_tool_fields(child);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn convert_custom_tool_to_function(value: &mut serde_json::Value) {
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if name == APPLY_PATCH_TOOL_NAME {
+        let description = apply_patch_function_description(
+            value.get("description").and_then(serde_json::Value::as_str),
+        );
+        *value = serde_json::json!({
+            "type": "function",
+            "name": name,
+            "description": description,
+            "strict": false,
+            "parameters": apply_patch_function_parameters(),
+        });
+        return;
+    }
+    let description = match value.get("description").and_then(serde_json::Value::as_str) {
+        Some(text) if !text.is_empty() => {
+            format!("{text} Pass the freeform text in the `input` argument.")
+        }
+        _ => "Pass the freeform text in the `input` argument.".to_string(),
+    };
+    *value = serde_json::json!({
+        "type": "function",
+        "name": name,
+        "description": description,
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "The freeform tool input text."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }
+    });
+}
+
+fn truncate_json_tool_names(value: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(name)) = map.get_mut("name")
+                && name.chars().count() > META_TOOL_NAME_MAX_CHARS {
+                    *name = name.chars().take(META_TOOL_NAME_MAX_CHARS).collect();
+                    changed = true;
+                }
+            for child in map.values_mut() {
+                changed |= truncate_json_tool_names(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                changed |= truncate_json_tool_names(child);
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 #[cfg(test)]

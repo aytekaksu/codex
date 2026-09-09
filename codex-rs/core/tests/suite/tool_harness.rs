@@ -462,6 +462,98 @@ A {file_name}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_function_call_emits_function_call_output() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let file_name = "function-notes.txt";
+    let file_path = cwd.path().join(file_name);
+    let call_id = "apply-patch-function-call";
+    let patch_content = format!(
+        r#"*** Begin Patch
+*** Add File: {file_name}
++Function apply patch
+*** End Patch"#
+    );
+    let arguments = json!({ "input": patch_content }).to_string();
+
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "apply_patch", &arguments),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "patch complete"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let session_model = session_configured.model.clone();
+    let cwd_path = cwd.abs();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
+
+    codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "please apply a patch".into(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(cwd_path)),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let req = second_mock.single_request();
+    let (output_text, _success_flag) = call_output(&req, call_id);
+    assert!(
+        !output_text.contains("aborted"),
+        "converted apply_patch must emit FunctionCallOutput, got {output_text:?}"
+    );
+    assert!(
+        output_text.contains("Success"),
+        "expected successful apply_patch output, got {output_text:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(file_path)?,
+        "Function apply patch\n",
+        "expected updated file content"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 

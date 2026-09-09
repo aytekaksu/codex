@@ -37,11 +37,17 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
     model: Option<String>,
+    /// Select a provider that already exists on the parent session. Roles cannot
+    /// define new providers or rewrite endpoints; they may only switch to a
+    /// provider the user already configured.
+    model_provider: Option<String>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
     model_verbosity: Option<Verbosity>,
     personality: Option<Personality>,
     service_tier: Option<String>,
+    model_context_window: Option<i64>,
+    model_auto_compact_token_limit: Option<i64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     features: BTreeMap<String, bool>,
     skills: Option<SkillsConfig>,
@@ -80,11 +86,16 @@ async fn apply_role_to_config_inner(
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
+        model_provider: role_config
+            .model_provider
+            .filter(|provider_id| config.model_providers.contains_key(provider_id)),
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
         model_verbosity: role_config.model_verbosity,
         personality: role_config.personality,
         service_tier: role_config.service_tier,
+        model_context_window: role_config.model_context_window,
+        model_auto_compact_token_limit: role_config.model_auto_compact_token_limit,
         ..Default::default()
     };
 
@@ -97,7 +108,10 @@ async fn apply_role_to_config_inner(
                     | Feature::Personality
                     | Feature::Plugins
                     | Feature::MemoryTool
-                    | Feature::RequestPermissionsTool),
+                    | Feature::RequestPermissionsTool
+                    | Feature::WebSearchRequest
+                    | Feature::WebSearchCached
+                    | Feature::StandaloneWebSearch),
                 ) = feature_for_key(&key)
             {
                 overrides.features.insert(feature.key().to_string(), false);
@@ -184,6 +198,21 @@ mod role_overrides {
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
+        }
+        if let Some(provider_id) = &overrides.model_provider {
+            let Some(info) = next_config.model_providers.get(provider_id).cloned() else {
+                return Err(anyhow!(
+                    "model_provider `{provider_id}` is not configured on the parent session"
+                ));
+            };
+            next_config.model_provider_id = provider_id.clone();
+            next_config.model_provider = info;
+        }
+        if let Some(context_window) = overrides.model_context_window {
+            next_config.model_context_window = Some(context_window);
+        }
+        if let Some(auto_compact) = overrides.model_auto_compact_token_limit {
+            next_config.model_auto_compact_token_limit = Some(auto_compact);
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());

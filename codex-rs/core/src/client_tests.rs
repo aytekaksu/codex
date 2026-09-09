@@ -1349,3 +1349,263 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn non_openai_requests_rewrite_encrypted_agent_messages() {
+    let mut input = vec![super::ResponseItem::AgentMessage {
+        id: None,
+        author: "/root".to_string(),
+        recipient: "/root/muse_cli_probe".to_string(),
+        content: vec![
+            super::AgentMessageInputContent::InputText {
+                text: "Message Type: NEW_TASK\nPayload:\n".to_string(),
+            },
+            super::AgentMessageInputContent::EncryptedContent {
+                encrypted_content: "gAAAAABencrypted".to_string(),
+            },
+        ],
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    super::rewrite_non_openai_response_items(&mut input);
+
+    match &input[0] {
+        super::ResponseItem::Message { role, content, .. } => {
+            assert_eq!(role, "user");
+            let super::ContentItem::InputText { text } = &content[0] else {
+                panic!("expected input_text");
+            };
+            assert!(text.contains("NEW_TASK"));
+            assert!(text.contains("encrypted inter-agent payload omitted"));
+            assert!(!text.contains("gAAAAAB"));
+        }
+        other => panic!("expected portable message, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_openai_tools_drop_web_search_content_types() {
+    let tools = serde_json::json!([
+        {
+            "type": "web_search",
+            "search_content_types": ["text", "image"],
+            "search_context_size": "medium"
+        },
+        {
+            "type": "function",
+            "name": "mcp__codex_apps__sites___create_source_repository_write_credential"
+        }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[0].get("search_content_types"), None);
+    assert_eq!(value[0]["type"], "web_search");
+    assert_eq!(
+        value[1]["name"],
+        "mcp__codex_apps__sites___create_source_repository_write_credenti"
+    );
+    assert_eq!(value[1]["name"].as_str().unwrap().chars().count(), 64);
+}
+
+#[test]
+fn non_openai_tools_rewrite_custom_apply_patch() {
+    let tools = serde_json::json!([
+        {
+            "type": "function",
+            "name": "exec_command"
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: begin_patch"
+            }
+        },
+        {
+            "type": "custom",
+            "name": "other_custom"
+        },
+        {
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "spawn_agent"
+                },
+                {
+                    "type": "custom",
+                    "name": "nested_custom"
+                }
+            ]
+        }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value.as_array().map(Vec::len), Some(4));
+    assert_eq!(value[0]["type"], "function");
+    assert_eq!(value[1]["type"], "function");
+    assert_eq!(value[1]["name"], "apply_patch");
+    assert_eq!(value[1].get("format"), None);
+    assert_eq!(value[1]["parameters"].get("required"), None);
+    assert_eq!(
+        value[1]["parameters"]["properties"]["operation"]["enum"],
+        serde_json::json!(["create_file", "update_file", "delete_file"])
+    );
+    assert!(
+        value[1]["description"]
+            .as_str()
+            .unwrap()
+            .contains("structured fields")
+    );
+    assert_eq!(value[2]["type"], "function");
+    assert_eq!(value[2]["name"], "other_custom");
+    assert_eq!(value[2].get("format"), None);
+    assert_eq!(value[2]["parameters"]["required"][0], "input");
+    assert_eq!(value[3]["type"], "namespace");
+    assert_eq!(value[3]["tools"].as_array().map(Vec::len), Some(2));
+    assert_eq!(value[3]["tools"][0]["name"], "spawn_agent");
+    assert_eq!(value[3]["tools"][1]["type"], "function");
+    assert_eq!(value[3]["tools"][1]["name"], "nested_custom");
+    assert_eq!(value[3]["tools"][1].get("format"), None);
+    assert_eq!(value[3]["tools"][1]["parameters"]["required"][0], "input");
+}
+
+#[test]
+fn non_openai_request_forces_tool_choice_auto() {
+    let request = serde_json::json!({
+        "tool_choice": "none",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&request).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value["tool_choice"], "auto");
+}
+
+#[test]
+fn non_openai_request_drops_truncation_unless_disabled() {
+    let request = serde_json::json!({
+        "truncation": "auto",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&request).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value.get("truncation"), None);
+
+    let disabled = serde_json::json!({
+        "truncation": "disabled",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&disabled).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value["truncation"], "disabled");
+}
+
+#[test]
+fn non_openai_tools_rename_reserved_browser_names_when_web_search_present() {
+    let tools = serde_json::json!([
+        { "type": "web_search" },
+        { "type": "function", "name": "browser.search" },
+        { "type": "function", "name": "browser.open" },
+        { "type": "function", "name": "browser.find" },
+        { "type": "function", "name": "browser.other" }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[1]["name"], "browser.search_tool");
+    assert_eq!(value[2]["name"], "browser.open_tool");
+    assert_eq!(value[3]["name"], "browser.find_tool");
+    assert_eq!(value[4]["name"], "browser.other");
+
+    let without_search = serde_json::json!([
+        { "type": "function", "name": "browser.search" }
+    ]);
+    let raw = serde_json::value::to_raw_value(&without_search).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[0]["name"], "browser.search");
+}
+
+#[test]
+fn non_openai_tools_collapse_extra_dots_in_names() {
+    let tools = serde_json::json!([
+        { "type": "function", "name": "a.b.c" },
+        { "type": "function", "name": "foo.bar.baz.qux" },
+        { "type": "function", "name": "already.one" },
+        {
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [{ "type": "function", "name": "ns.inner.extra" }]
+        }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[0]["name"], "a.b_c");
+    assert_eq!(value[1]["name"], "foo.bar_baz_qux");
+    assert_eq!(value[2]["name"], "already.one");
+    assert_eq!(value[3]["tools"][0]["name"], "ns.inner_extra");
+}
+
+#[test]
+fn non_openai_requests_rewrite_custom_tool_calls() {
+    let mut input = vec![
+        super::ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: "call-apply-patch".to_string(),
+            name: "apply_patch".to_string(),
+            namespace: None,
+            input: "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        super::ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "call-apply-patch".to_string(),
+            name: Some("apply_patch".to_string()),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                "Success. Updated files.".to_string(),
+            ),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    super::rewrite_non_openai_response_items(&mut input);
+
+    match &input[0] {
+        super::ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        } => {
+            assert_eq!(name, "apply_patch");
+            assert_eq!(call_id, "call-apply-patch");
+            let parsed: serde_json::Value = serde_json::from_str(arguments).expect("args json");
+            assert!(parsed["input"].as_str().unwrap().contains("Begin Patch"));
+        }
+        other => panic!("expected function_call, got {other:?}"),
+    }
+    match &input[1] {
+        super::ResponseItem::FunctionCallOutput {
+            name,
+            call_id,
+            output,
+            ..
+        } => {
+            assert_eq!(name.as_deref(), Some("apply_patch"));
+            assert_eq!(call_id.as_deref(), Some("call-apply-patch"));
+            assert_eq!(output.text_content(), Some("Success. Updated files."));
+        }
+        other => panic!("expected function_call_output, got {other:?}"),
+    }
+}

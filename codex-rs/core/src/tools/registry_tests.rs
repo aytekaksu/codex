@@ -2,6 +2,7 @@ use super::*;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::TruncationPolicy;
 use futures::future::BoxFuture;
@@ -121,6 +122,47 @@ impl LifecycleTestHandler {
 }
 
 impl CoreToolRuntime for LifecycleTestHandler {}
+
+struct CustomOnlyTestHandler {
+    seen: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl ToolExecutor<ToolInvocation> for CustomOnlyTestHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("other_custom")
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        test_spec(&self.tool_name())
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        Box::pin(async move {
+            let ToolPayload::Custom { input } = invocation.payload else {
+                panic!("expected Custom payload, got {:?}", invocation.payload);
+            };
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
+            Ok(
+                Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                    "ok".to_string(),
+                    Some(true),
+                )) as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl CoreToolRuntime for CustomOnlyTestHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Custom { .. })
+    }
+}
 
 fn test_spec(tool_name: &codex_tools::ToolName) -> codex_tools::ToolSpec {
     codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
@@ -689,6 +731,44 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
         result.code_mode_result(),
         serde_json::json!({ "typed": true })
     );
+}
+
+#[tokio::test]
+async fn dispatch_rewrites_function_input_for_custom_only_handlers() -> anyhow::Result<()> {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(CustomOnlyTestHandler {
+        seen: Arc::clone(&seen),
+    });
+    let registry = ToolRegistry::from_tools([handler as Arc<dyn CoreToolRuntime>]);
+    let mut invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "call-custom",
+        codex_tools::ToolName::plain("other_custom"),
+    );
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({ "input": "freeform text" }).to_string(),
+    };
+
+    let result = registry
+        .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
+        .await?;
+
+    assert_eq!(
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref(),
+        Some("freeform text")
+    );
+    assert!(matches!(result.payload, ToolPayload::Function { .. }));
+    assert!(matches!(
+        result
+            .result
+            .to_response_item(&result.call_id, &result.payload),
+        ResponseInputItem::FunctionCallOutput { .. }
+    ));
+    Ok(())
 }
 
 #[tokio::test]

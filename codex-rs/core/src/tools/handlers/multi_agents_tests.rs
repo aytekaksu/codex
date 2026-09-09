@@ -15,6 +15,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -83,6 +84,16 @@ fn invocation(
     tool_name: &str,
     payload: ToolPayload,
 ) -> ToolInvocation {
+    namespaced_invocation(session, turn, None, tool_name, payload)
+}
+
+fn namespaced_invocation(
+    session: Arc<crate::session::session::Session>,
+    turn: Arc<TurnContext>,
+    namespace: Option<&str>,
+    tool_name: &str,
+    payload: ToolPayload,
+) -> ToolInvocation {
     let step_context = StepContext::for_test(Arc::clone(&turn));
     ToolInvocation {
         session,
@@ -91,10 +102,24 @@ fn invocation(
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
-        tool_name: codex_tools::ToolName::plain(tool_name),
+        tool_name: match namespace {
+            Some(namespace) => codex_tools::ToolName::namespaced(namespace, tool_name),
+            None => codex_tools::ToolName::plain(tool_name),
+        },
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
     }
+}
+
+fn install_muse_spark_role(config: &mut crate::config::Config) {
+    config.agent_roles.insert(
+        "muse_spark".to_string(),
+        AgentRoleConfig {
+            description: Some("Muse Spark worker".to_string()),
+            config_file: None,
+            nickname_candidates: None,
+        },
+    );
 }
 
 fn function_payload(args: serde_json::Value) -> ToolPayload {
@@ -1016,7 +1041,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
             )
     }));
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::default()
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -1041,6 +1066,271 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                         && communication.encrypted_content.as_deref() == Some("encrypted-send-message")
                         && !communication.trigger_turn
             )
+    }));
+}
+
+#[tokio::test]
+async fn collaboration_spawn_rejects_muse_spark() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+
+    let Err(err) = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "count the files",
+                "task_name": "muse_inventory"
+            })),
+        ))
+        .await
+    else {
+        panic!("collaboration spawn of Muse should fail");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected model-facing Muse collaboration error");
+    };
+    assert!(message.contains("external_agents"));
+}
+
+#[tokio::test]
+async fn external_agents_spawn_sends_plaintext_user_input() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    install_muse_spark_role(&mut config);
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let marker = "exact plaintext muse task marker";
+    SpawnAgentHandlerV2::external(SpawnAgentToolOptions::default())
+        .handle(namespaced_invocation(
+            session.clone(),
+            turn.clone(),
+            Some("external_agents"),
+            "spawn_agent",
+            function_payload(json!({
+                "message": marker,
+                "task_name": "muse_inventory",
+                "fork_turns": "all"
+            })),
+        ))
+        .await
+        .expect("external Muse spawn should succeed");
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "muse_inventory")
+        .await
+        .expect("muse child should resolve");
+    let child = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("muse child thread should exist");
+    wait_for_recorded_user_input(
+        &child,
+        &[UserInput::Text {
+            text: marker.to_string(),
+            text_elements: Vec::new(),
+        }],
+    )
+    .await;
+    assert!(!manager.captured_ops().iter().any(|(id, op)| {
+        *id == child_thread_id && matches!(op, Op::InterAgentCommunication { .. })
+    }));
+
+    let list_output = ListAgentsHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "list_agents",
+            function_payload(json!({})),
+        ))
+        .await
+        .expect("list_agents should work after external spawn");
+    let (list_text, _) = expect_text_output(list_output);
+    assert!(list_text.contains("muse_inventory"));
+
+    WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({ "timeout_ms": 50 })),
+        ))
+        .await
+        .expect("wait_agent should accept a Muse child");
+}
+
+#[tokio::test]
+async fn collaboration_send_and_followup_reject_muse_spark() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    install_muse_spark_role(&mut config);
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    SpawnAgentHandlerV2::external(SpawnAgentToolOptions::default())
+        .handle(namespaced_invocation(
+            session.clone(),
+            turn.clone(),
+            Some("external_agents"),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot muse",
+                "task_name": "muse_inventory"
+            })),
+        ))
+        .await
+        .expect("external Muse spawn should succeed");
+
+    let Err(send_err) = SendMessageHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "send_message",
+            function_payload(json!({
+                "target": "muse_inventory",
+                "message": "continue in collaboration"
+            })),
+        ))
+        .await
+    else {
+        panic!("collaboration send to Muse should fail");
+    };
+    let FunctionCallError::RespondToModel(send_message) = send_err else {
+        panic!("expected model-facing Muse collaboration error");
+    };
+    assert!(send_message.contains("external_agents"));
+
+    let Err(followup_err) = FollowupTaskHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "followup_task",
+            function_payload(json!({
+                "target": "muse_inventory",
+                "message": "follow up in collaboration"
+            })),
+        ))
+        .await
+    else {
+        panic!("collaboration followup to Muse should fail");
+    };
+    let FunctionCallError::RespondToModel(followup_message) = followup_err else {
+        panic!("expected model-facing Muse collaboration error");
+    };
+    assert!(followup_message.contains("external_agents"));
+}
+
+#[tokio::test]
+async fn external_agents_send_and_followup_deliver_plaintext_user_input() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    install_muse_spark_role(&mut config);
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    SpawnAgentHandlerV2::external(SpawnAgentToolOptions::default())
+        .handle(namespaced_invocation(
+            session.clone(),
+            turn.clone(),
+            Some("external_agents"),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot muse",
+                "task_name": "muse_inventory"
+            })),
+        ))
+        .await
+        .expect("external Muse spawn should succeed");
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "muse_inventory")
+        .await
+        .expect("muse child should resolve");
+
+    SendMessageHandlerV2::external()
+        .handle(namespaced_invocation(
+            session.clone(),
+            turn.clone(),
+            Some("external_agents"),
+            "send_message",
+            function_payload(json!({
+                "target": "muse_inventory",
+                "message": "exact plaintext send"
+            })),
+        ))
+        .await
+        .expect("external send should succeed");
+
+    FollowupTaskHandlerV2::external()
+        .handle(namespaced_invocation(
+            session,
+            turn,
+            Some("external_agents"),
+            "followup_task",
+            function_payload(json!({
+                "target": "muse_inventory",
+                "message": "exact plaintext followup"
+            })),
+        ))
+        .await
+        .expect("external followup should succeed");
+
+    assert!(!manager.captured_ops().iter().any(|(id, op)| {
+        *id == child_thread_id && matches!(op, Op::InterAgentCommunication { .. })
     }));
 }
 
@@ -1212,7 +1502,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         agent_role: None,
     });
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1288,7 +1578,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let Err(err) = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1670,7 +1960,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::default().handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1725,7 +2015,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::default().handle(invocation).await else {
         panic!("send_message interrupt parameter should be rejected");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1813,7 +2103,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
+    FollowupTaskHandlerV2::default()
         .handle(invocation(
             session,
             turn,
@@ -1953,7 +2243,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = FollowupTaskHandlerV2.handle(invocation).await else {
+    let Err(err) = FollowupTaskHandlerV2::default().handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {

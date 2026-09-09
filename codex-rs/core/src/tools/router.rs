@@ -9,6 +9,8 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 #[cfg(test)]
 use crate::tools::handlers::ToolSearchHandlerCache;
+use crate::tools::handlers::multi_agents_v2::external_agents::is_external_agents_mutating_tool;
+use crate::tools::handlers::multi_agents_v2::external_agents::reject_encrypted_external_agents_args;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
@@ -359,8 +361,11 @@ impl ToolRouter {
             tool_name,
             call_id,
             payload,
-            ..
+            encrypted_function_args,
         } = call;
+        if is_external_agents_mutating_tool(&tool_name) {
+            reject_encrypted_external_agents_args(&encrypted_function_args)?;
+        }
 
         // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
         let turn = Arc::clone(&step_context.turn);

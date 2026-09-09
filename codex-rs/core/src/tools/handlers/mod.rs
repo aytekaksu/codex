@@ -3,6 +3,7 @@ pub(crate) mod apply_patch_spec;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
+pub(crate) mod external_agents_spec;
 mod get_context_remaining;
 pub(crate) mod get_context_remaining_spec;
 mod list_available_plugins_to_install;

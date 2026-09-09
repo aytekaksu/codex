@@ -1,6 +1,7 @@
 use super::*;
 use crate::ModelsManagerConfig;
 use codex_protocol::config_types::Personality;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ApprovalMessages;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::CollaborationModeMessages;
@@ -310,6 +311,18 @@ fn baked_personality_section_is_preserved_without_enabled_explicit_none() {
             instructions
         );
     }
+}
+
+#[test]
+fn muse_spark_fallback_enables_apply_patch_and_search() {
+    let model = model_info_from_slug("muse-spark-1.3");
+
+    assert_eq!(
+        model.apply_patch_tool_type,
+        Some(ApplyPatchToolType::Freeform)
+    );
+    assert!(model.supports_search_tool);
+    assert!(model.used_fallback_model_metadata);
 }
 
 #[test]

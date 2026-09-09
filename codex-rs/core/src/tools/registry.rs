@@ -13,6 +13,8 @@ use crate::memory_usage::emit_metric_for_tool_read;
 use crate::memory_usage::shell_script_for_invocation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::apply_patch_function::APPLY_PATCH_TOOL_NAME;
+use crate::tools::apply_patch_function::custom_input_from_function_arguments;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -516,7 +518,11 @@ impl ToolRegistry {
         let tool = match self.tool(&tool_name) {
             Some(tool) => tool,
             None => {
-                let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
+                let message = unsupported_tool_call_message(
+                    &invocation.payload,
+                    &tool_name,
+                    self.tools.keys(),
+                );
                 let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
                 let mut tool_result_tags = Vec::with_capacity(2);
                 sandbox_tags.append_metric_tags(&mut tool_result_tags);
@@ -544,6 +550,30 @@ impl ToolRegistry {
                 extra_trace_fields.push((*key, value.as_str()));
             } else {
                 tool_result_tags.push((*key, value.as_str()));
+            }
+        }
+        let wire_payload = invocation.payload.clone();
+        match adapt_function_payload_for_custom_handler(
+            tool.as_ref(),
+            &tool_name,
+            &invocation.payload,
+        ) {
+            Ok(Some(custom_payload)) => invocation.payload = custom_payload,
+            Ok(None) => {}
+            Err(err) => {
+                let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
+                otel.tool_result_with_tags(
+                    &tool_name,
+                    &call_id_owned,
+                    log_payload.as_ref(),
+                    Duration::ZERO,
+                    /*success*/ false,
+                    &err.to_string(),
+                    &tool_result_tags,
+                    &extra_trace_fields,
+                );
+                dispatch_trace.record_failed(&err);
+                return Err(err);
             }
         }
         if !tool.matches_kind(&invocation.payload) {
@@ -739,6 +769,7 @@ impl ToolRegistry {
                         });
                     }
                 }
+                result.payload = wire_payload;
                 tool.on_tool_result_accepted(&invocation, result.result.as_ref());
                 dispatch_trace.record_completed(
                     &invocation,
@@ -815,11 +846,100 @@ fn function_hook_tool_input(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
-fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) -> String {
-    match payload {
+fn adapt_function_payload_for_custom_handler(
+    tool: &dyn CoreToolRuntime,
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+) -> Result<Option<ToolPayload>, FunctionCallError> {
+    if !matches!(payload, ToolPayload::Function { .. }) {
+        return Ok(None);
+    }
+    if !tool.matches_kind(&ToolPayload::Custom {
+        input: String::new(),
+    }) || tool.matches_kind(&ToolPayload::Function {
+        arguments: String::new(),
+    }) {
+        return Ok(None);
+    }
+    let Some(input) = function_payload_custom_input(tool_name, payload)? else {
+        return Ok(None);
+    };
+    Ok(Some(ToolPayload::Custom { input }))
+}
+
+fn function_payload_custom_input(
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+) -> Result<Option<String>, FunctionCallError> {
+    let ToolPayload::Function { arguments } = payload else {
+        return Ok(None);
+    };
+    if tool_name.name == APPLY_PATCH_TOOL_NAME {
+        return custom_input_from_function_arguments(arguments);
+    }
+    Ok(generic_function_custom_input(arguments))
+}
+
+fn generic_function_custom_input(arguments: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    if let Some(input) = value
+        .get("input")
+        .or_else(|| value.get("patch"))
+        .or_else(|| value.get("command"))
+        .and_then(Value::as_str)
+    {
+        return Some(input.to_string());
+    }
+    value.as_str().map(ToString::to_string)
+}
+
+fn unsupported_tool_call_message<'a>(
+    payload: &ToolPayload,
+    tool_name: &ToolName,
+    available: impl Iterator<Item = &'a ToolName>,
+) -> String {
+    let base = match payload {
         ToolPayload::Custom { .. } => format!("unsupported custom tool call: {tool_name}"),
         _ => format!("unsupported call: {tool_name}"),
+    };
+    let closest = closest_tool_names(tool_name, available);
+    if closest.is_empty() {
+        return base;
     }
+    format!("{base}. Closest tools: {}", closest.join(", "))
+}
+
+fn closest_tool_names<'a>(
+    requested: &ToolName,
+    available: impl Iterator<Item = &'a ToolName>,
+) -> Vec<String> {
+    let requested_flat = flat_tool_name(requested);
+    let requested_lower = requested_flat.to_ascii_lowercase();
+    let requested_name = requested.name.to_ascii_lowercase();
+    let mut matches = available
+        .filter_map(|name| {
+            let flat = flat_tool_name(name);
+            let lower = flat.to_ascii_lowercase();
+            let tool_name = name.name.to_ascii_lowercase();
+            if lower == requested_lower {
+                return None;
+            }
+            if lower.starts_with(&requested_lower)
+                || requested_lower.starts_with(&lower)
+                || lower.contains(&requested_lower)
+                || requested_lower.contains(&lower)
+                || tool_name.contains(&requested_name)
+                || requested_name.contains(&tool_name)
+            {
+                return Some(flat.into_owned());
+            }
+            None
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches.truncate(5);
+    matches
 }
 #[cfg(test)]
 #[path = "registry_tests.rs"]

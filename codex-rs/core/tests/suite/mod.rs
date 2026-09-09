@@ -68,6 +68,7 @@ mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;
+mod external_agents;
 mod external_auth;
 mod fork_thread;
 mod git_enrichment;
@@ -112,6 +113,7 @@ mod multi_agent_mode;
 mod multi_agent_resume;
 #[cfg(unix)]
 mod multi_exec_server_sandbox;
+mod muse_search;
 mod network_approval;
 mod openai_file_mcp;
 mod otel;

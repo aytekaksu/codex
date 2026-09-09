@@ -741,9 +741,10 @@ fn spawn_agent_tool_description_v2(
         {agent_role_guidance}
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
-The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+OpenAI children spawned through this tool inherit the collaboration surface. Muse Spark and other non-OpenAI workers must be spawned through `external_agents` only; they do not receive encrypted collaboration messages or the same parent tool set.
 {inherited_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
+After an `external_agents` spawn, call one long `collaboration.wait_agent`, then one `collaboration.list_agents`. Inspect files and tests yourself; do not treat child prose as verification.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 

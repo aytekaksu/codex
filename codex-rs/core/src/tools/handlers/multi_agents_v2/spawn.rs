@@ -7,9 +7,17 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::session::multi_agents::resolve_usage_hints;
+use crate::tools::handlers::external_agents_spec::create_external_spawn_agent_tool;
 use crate::tools::handlers::multi_agents::collab_tool_call_status;
+use crate::tools::handlers::multi_agents_common::infer_muse_spark_role;
+use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
+use crate::tools::handlers::multi_agents_v2::external_agents::AgentTransport;
+use crate::tools::handlers::multi_agents_v2::external_agents::collaboration_muse_error;
+use crate::tools::handlers::multi_agents_v2::external_agents::is_allowlisted_external_role;
+use crate::tools::handlers::multi_agents_v2::external_agents::plaintext_user_input;
+use crate::tools::handlers::multi_agents_v2::external_agents::validate_plaintext_agent_message;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::AgentPath;
@@ -20,11 +28,22 @@ use codex_tools::ToolSpec;
 #[derive(Default)]
 pub(crate) struct Handler {
     options: SpawnAgentToolOptions,
+    surface: AgentTransport,
 }
 
 impl Handler {
     pub(crate) fn new(options: SpawnAgentToolOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            surface: AgentTransport::Collaboration,
+        }
+    }
+
+    pub(crate) fn external(options: SpawnAgentToolOptions) -> Self {
+        Self {
+            options,
+            surface: AgentTransport::ExternalAgents,
+        }
     }
 }
 
@@ -34,7 +53,12 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_spawn_agent_tool_v2(self.options.clone())
+        match self.surface {
+            AgentTransport::Collaboration => create_spawn_agent_tool_v2(self.options.clone()),
+            AgentTransport::ExternalAgents => {
+                create_external_spawn_agent_tool(self.options.clone())
+            }
+        }
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -47,7 +71,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
             let turn_id = invocation.step_context.turn.sub_id.clone();
             let call_id = invocation.call_id.clone();
             let started_at_ms = now_unix_timestamp_ms();
-            let result = handle_spawn_agent(invocation).await;
+            let result = handle_spawn_agent(invocation, self.surface).await;
             let completed_at_ms = now_unix_timestamp_ms();
             let (status, receiver_thread_ids, agents_states) = match &result {
                 Ok((_, thread_id, agent_status, _)) => (
@@ -92,6 +116,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
+    surface: AgentTransport,
 ) -> Result<
     (
         SpawnAgentResult,
@@ -112,13 +137,38 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let fork_mode = args.fork_mode()?;
-    let message = message_content(args.message)?;
-    let role_name = args
-        .agent_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
+    let inferred_muse_role = infer_muse_spark_role(
+        &args.task_name,
+        args.agent_type.as_deref(),
+        args.model.as_deref(),
+    );
+    if surface == AgentTransport::Collaboration && inferred_muse_role.is_some() {
+        return Err(collaboration_muse_error());
+    }
+    let mut fork_mode = args.fork_mode()?;
+    let message = if surface == AgentTransport::ExternalAgents {
+        if !is_allowlisted_external_role(
+            &turn.config,
+            &args.task_name,
+            args.agent_type.as_deref(),
+            args.model.as_deref(),
+        ) {
+            return Err(FunctionCallError::RespondToModel(
+                "external_agents.spawn_agent only accepts allowlisted non-OpenAI roles such as muse_spark"
+                    .to_string(),
+            ));
+        }
+        fork_mode = None;
+        validate_plaintext_agent_message(args.message)?
+    } else {
+        message_content(args.message)?
+    };
+    let role_name = inferred_muse_role.or_else(|| {
+        args.agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+    });
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -129,7 +179,9 @@ async fn handle_spawn_agent(
         &session,
         turn.as_ref(),
         &mut config,
-        args.model.as_deref(),
+        args.model
+            .as_deref()
+            .filter(|model| !looks_like_muse_spark_name(model)),
         args.reasoning_effort.clone(),
     )
     .await?;
@@ -165,18 +217,6 @@ async fn handle_spawn_agent(
             "spawned agent is missing a canonical task name".to_string(),
         )
     })?;
-    let author = turn
-        .session_source
-        .get_agent_path()
-        .unwrap_or_else(AgentPath::root);
-    let communication = communication_from_tool_message(
-        author,
-        new_agent_path.clone(),
-        message,
-        &source,
-        /*trigger_turn*/ true,
-    );
-    let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
     let multi_agent_v2_usage_hints =
         if is_full_history_fork && turn.multi_agent_version == MultiAgentVersion::V2 {
             let child_model_info = match config.model.as_deref() {
@@ -204,28 +244,55 @@ async fn handle_spawn_agent(
         } else {
             None
         };
-    let spawned_agent = Box::pin(
-        session
-            .services
-            .agent_control
-            .spawn_agent_with_communication(
+    let spawn_options = SpawnAgentOptions {
+        fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+        fork_mode,
+        parent_thread_id: Some(session.thread_id),
+        parent_turn_id: Some(turn.sub_id.clone()),
+        root_turn_id: turn.turn_metadata_state.root_turn_id(),
+        environments: Some(step_context.environments.to_selections()),
+        multi_agent_v2_usage_hints,
+        cyber_access_program: turn.cyber_access_program,
+    };
+    let spawned_agent = match surface {
+        AgentTransport::ExternalAgents => {
+            Box::pin(session.services.agent_control.spawn_agent_with_metadata(
                 config,
-                communication,
-                context,
+                plaintext_user_input(message),
                 Some(spawn_source),
-                SpawnAgentOptions {
-                    fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
-                    fork_mode,
-                    parent_thread_id: Some(session.thread_id),
-                    parent_turn_id: Some(turn.sub_id.clone()),
-                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
-                    environments: Some(step_context.environments.to_selections()),
-                    multi_agent_v2_usage_hints,
-                    cyber_access_program: turn.cyber_access_program,
-                },
-            ),
-    )
-    .await
+                spawn_options,
+            ))
+            .await
+        }
+        AgentTransport::Collaboration => {
+            let author = turn
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(AgentPath::root);
+            let communication = communication_from_tool_message(
+                author,
+                new_agent_path.clone(),
+                message,
+                &source,
+                /*trigger_turn*/ true,
+            );
+            let context =
+                AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
+            Box::pin(
+                session
+                    .services
+                    .agent_control
+                    .spawn_agent_with_communication(
+                        config,
+                        communication,
+                        context,
+                        Some(spawn_source),
+                        spawn_options,
+                    ),
+            )
+            .await
+        }
+    }
     .map_err(collab_spawn_error)?;
     let new_thread_id = spawned_agent.thread_id;
     let agent_status = spawned_agent.status;
