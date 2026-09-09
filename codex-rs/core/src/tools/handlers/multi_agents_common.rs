@@ -29,16 +29,10 @@ use serde_json::Value as JsonValue;
 /// Configured Muse Spark worker role. ChatGPT hides `agent_type`, so spawn
 /// also infers this from `task_name` / `model` slugs the parent is allowed to send.
 pub(crate) const MUSE_SPARK_ROLE: &str = "muse_spark";
-/// Full-history forks inherit the parent model unless a role is applied. Muse
-/// still needs recent parent context, but `all` is more history than Meta can
-/// ingest cleanly. Match the hook's default.
-pub(crate) const MUSE_SPARK_FULL_HISTORY_FORK_TURNS: usize = 30;
 
 pub(crate) fn looks_like_muse_spark_name(value: &str) -> bool {
     let lowered = value.trim().to_ascii_lowercase();
-    lowered.starts_with("muse_")
-        || lowered.contains("muse-spark")
-        || lowered.contains("muse_spark")
+    lowered.starts_with("muse_") || lowered.contains("muse-spark") || lowered.contains("muse_spark")
 }
 
 pub(crate) fn infer_muse_spark_role(
@@ -472,9 +466,9 @@ fn validate_spawn_agent_reasoning_effort(
 
 #[cfg(test)]
 mod muse_spark_role_tests {
+    use super::MUSE_SPARK_ROLE;
     use super::infer_muse_spark_role;
     use super::looks_like_muse_spark_name;
-    use super::MUSE_SPARK_ROLE;
 
     #[test]
     fn infers_muse_spark_from_task_name_prefix() {

@@ -8,6 +8,12 @@ use super::*;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::handlers::multi_agents_v2::external_agents::AgentTransport;
+use crate::tools::handlers::multi_agents_v2::external_agents::agent_is_muse_spark;
+use crate::tools::handlers::multi_agents_v2::external_agents::collaboration_muse_error;
+use crate::tools::handlers::multi_agents_v2::external_agents::is_allowlisted_external_role;
+use crate::tools::handlers::multi_agents_v2::external_agents::plaintext_user_input;
+use crate::tools::handlers::multi_agents_v2::external_agents::validate_plaintext_agent_message;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDeliveryMode {
@@ -56,8 +62,8 @@ pub(super) async fn handle_message_string_tool(
     target: String,
     message: String,
     analytics: &mut ToolCallAnalytics,
+    surface: AgentTransport,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    let message = message_content(message)?;
     let ToolInvocation {
         session,
         turn,
@@ -72,6 +78,31 @@ pub(super) async fn handle_message_string_tool(
         .agent_control
         .ensure_agent_known(receiver_thread_id)
         .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    if surface == AgentTransport::Collaboration && agent_is_muse_spark(&receiver_agent) {
+        return Err(collaboration_muse_error());
+    }
+    let message = if surface == AgentTransport::ExternalAgents {
+        if !agent_is_muse_spark(&receiver_agent)
+            && !is_allowlisted_external_role(
+                &turn.config,
+                receiver_agent
+                    .agent_path
+                    .as_ref()
+                    .map(AgentPath::name)
+                    .unwrap_or(target.as_str()),
+                receiver_agent.agent_role.as_deref(),
+                None,
+            )
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "external_agents only messages allowlisted non-OpenAI workers such as Muse Spark"
+                    .to_string(),
+            ));
+        }
+        validate_plaintext_agent_message(message)?
+    } else {
+        message_content(message)?
+    };
     if mode == MessageDeliveryMode::TriggerTurn
         && receiver_agent
             .agent_path
@@ -92,41 +123,57 @@ pub(super) async fn handle_message_string_tool(
         .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
-    let author = turn
-        .session_source
-        .get_agent_path()
-        .unwrap_or_else(AgentPath::root);
-    let communication = communication_from_tool_message(
-        author,
-        receiver_agent_path.clone(),
-        message,
-        &source,
-        mode.trigger_turn(),
-    );
-    let kind = match mode {
-        MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
-        MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
-    };
-    let context = AgentCommunicationContext::new(kind, session.thread_id);
     let parent_turn_id =
         matches!(mode, MessageDeliveryMode::TriggerTurn).then(|| turn.sub_id.clone());
-    let result = session
-        .services
-        .agent_control
-        .send_inter_agent_communication(
-            receiver_thread_id,
-            communication,
-            context,
-            crate::TurnStartOptions {
-                parent_turn_id,
-                root_turn_id: turn.turn_metadata_state.root_turn_id(),
-                cyber_access_program: turn.cyber_access_program,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|err| collab_agent_error(receiver_thread_id, err));
-    result?;
+    let start_options = crate::TurnStartOptions {
+        parent_turn_id,
+        root_turn_id: turn.turn_metadata_state.root_turn_id(),
+        cyber_access_program: turn.cyber_access_program,
+        ..Default::default()
+    };
+    match surface {
+        AgentTransport::ExternalAgents => {
+            session
+                .services
+                .agent_control
+                .send_input(
+                    receiver_thread_id,
+                    plaintext_user_input(message),
+                    start_options,
+                )
+                .await
+                .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        }
+        AgentTransport::Collaboration => {
+            let author = turn
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(AgentPath::root);
+            let communication = communication_from_tool_message(
+                author,
+                receiver_agent_path.clone(),
+                message,
+                &source,
+                mode.trigger_turn(),
+            );
+            let kind = match mode {
+                MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
+                MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
+            };
+            let context = AgentCommunicationContext::new(kind, session.thread_id);
+            session
+                .services
+                .agent_control
+                .send_inter_agent_communication(
+                    receiver_thread_id,
+                    communication,
+                    context,
+                    start_options,
+                )
+                .await
+                .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        }
+    }
     emit_sub_agent_activity(
         &session,
         &turn,

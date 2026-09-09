@@ -37,6 +37,7 @@ pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod analytics;
+pub(crate) mod external_agents;
 mod followup_task;
 mod interrupt_agent;
 mod list_agents;
@@ -44,6 +45,8 @@ mod message_tool;
 mod send_message;
 mod spawn;
 pub(crate) mod wait;
+
+pub(crate) use external_agents::EXTERNAL_AGENTS_NAMESPACE;
 
 pub(crate) async fn emit_sub_agent_activity(
     session: &crate::session::session::Session,

@@ -32,6 +32,7 @@ use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
+use crate::tools::handlers::external_agents_spec::EXTERNAL_AGENTS_NAMESPACE_DESCRIPTION;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
 use crate::tools::handlers::multi_agents::ResumeAgentHandler;
 use crate::tools::handlers::multi_agents::SendInputHandler;
@@ -45,6 +46,7 @@ use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_v2::EXTERNAL_AGENTS_NAMESPACE;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -1304,7 +1306,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 multi_agent_v2_handler(
                     SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
                         available_models: turn_context.available_models.clone(),
-                        agent_type_description,
+                        agent_type_description: agent_type_description.clone(),
                         expose_agent_type: !turn_context.config.agent_roles.is_empty(),
                         hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
                         expose_spawn_agent_model_overrides: turn_context
@@ -1319,11 +1321,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 exposure,
             );
             registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
+                multi_agent_v2_handler(SendMessageHandlerV2::collaboration(), tool_namespace),
                 exposure,
             );
             registry.register_trusted_with_exposure(
-                multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
+                multi_agent_v2_handler(FollowupTaskHandlerV2::collaboration(), tool_namespace),
                 exposure,
             );
             if turn_context.config.multi_agent_v2.wait_agent_enabled {
@@ -1342,6 +1344,23 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             registry.register_trusted_with_exposure(
                 multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
                 exposure,
+            );
+            add_external_agents_tools(
+                turn_context,
+                registry,
+                exposure,
+                SpawnAgentToolOptions {
+                    available_models: turn_context.available_models.clone(),
+                    agent_type_description,
+                    expose_agent_type: !turn_context.config.agent_roles.is_empty(),
+                    hide_agent_type_model_reasoning: hide_spawn_agent_metadata,
+                    expose_spawn_agent_model_overrides: turn_context
+                        .config
+                        .multi_agent_v2
+                        .expose_spawn_agent_model_overrides,
+                    multi_agent_version: turn_context.multi_agent_version,
+                    usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                },
             );
         } else {
             let agent_type_description =
@@ -1454,22 +1473,69 @@ fn append_extension_tool_executors(
     standalone_web_search_tool
 }
 
+fn add_external_agents_tools(
+    turn_context: &TurnContext,
+    registry: &mut ToolRegistry,
+    exposure: ToolExposure,
+    spawn_options: SpawnAgentToolOptions,
+) {
+    if !namespace_tools_enabled(turn_context) {
+        return;
+    }
+    registry.register_trusted_with_exposure(
+        namespaced_handler(
+            SpawnAgentHandlerV2::external(spawn_options),
+            EXTERNAL_AGENTS_NAMESPACE,
+            EXTERNAL_AGENTS_NAMESPACE_DESCRIPTION,
+        ),
+        exposure,
+    );
+    registry.register_trusted_with_exposure(
+        namespaced_handler(
+            SendMessageHandlerV2::external(),
+            EXTERNAL_AGENTS_NAMESPACE,
+            EXTERNAL_AGENTS_NAMESPACE_DESCRIPTION,
+        ),
+        exposure,
+    );
+    registry.register_trusted_with_exposure(
+        namespaced_handler(
+            FollowupTaskHandlerV2::external(),
+            EXTERNAL_AGENTS_NAMESPACE,
+            EXTERNAL_AGENTS_NAMESPACE_DESCRIPTION,
+        ),
+        exposure,
+    );
+}
+
 fn multi_agent_v2_handler(
     handler: impl CoreToolRuntime + 'static,
     namespace: Option<&str>,
 ) -> Arc<dyn CoreToolRuntime> {
     match namespace {
-        Some(namespace) => Arc::new(MultiAgentV2NamespaceOverride {
-            handler: Arc::new(handler),
-            namespace: namespace.to_string(),
-        }),
+        Some(namespace) => {
+            namespaced_handler(handler, namespace, MULTI_AGENT_V2_NAMESPACE_DESCRIPTION)
+        }
         None => Arc::new(handler),
     }
+}
+
+fn namespaced_handler(
+    handler: impl CoreToolRuntime + 'static,
+    namespace: &str,
+    description: &str,
+) -> Arc<dyn CoreToolRuntime> {
+    Arc::new(MultiAgentV2NamespaceOverride {
+        handler: Arc::new(handler),
+        namespace: namespace.to_string(),
+        description: description.to_string(),
+    })
 }
 
 struct MultiAgentV2NamespaceOverride {
     handler: Arc<dyn CoreToolRuntime>,
     namespace: String,
+    description: String,
 }
 
 impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
@@ -1481,7 +1547,7 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
         match self.handler.spec() {
             ToolSpec::Function(tool) => ToolSpec::Namespace(ResponsesApiNamespace {
                 name: self.namespace.clone(),
-                description: MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string(),
+                description: self.description.clone(),
                 tools: vec![ResponsesApiNamespaceTool::Function(tool)],
             }),
             spec => spec,
