@@ -546,6 +546,11 @@ impl ToolRegistry {
                 tool_result_tags.push((*key, value.as_str()));
             }
         }
+        if let Some(custom_payload) =
+            adapt_function_payload_for_custom_handler(tool.as_ref(), &invocation.payload)
+        {
+            invocation.payload = custom_payload;
+        }
         if !tool.matches_kind(&invocation.payload) {
             let message = format!("tool {tool_name} invoked with incompatible payload");
             let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
@@ -813,6 +818,41 @@ fn function_hook_tool_input(arguments: &str) -> Value {
     }
 
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+fn adapt_function_payload_for_custom_handler(
+    tool: &dyn CoreToolRuntime,
+    payload: &ToolPayload,
+) -> Option<ToolPayload> {
+    if !matches!(payload, ToolPayload::Function { .. }) {
+        return None;
+    }
+    if !tool.matches_kind(&ToolPayload::Custom {
+        input: String::new(),
+    }) || tool.matches_kind(&ToolPayload::Function {
+        arguments: String::new(),
+    }) {
+        return None;
+    }
+    Some(ToolPayload::Custom {
+        input: function_payload_custom_input(payload)?,
+    })
+}
+
+fn function_payload_custom_input(payload: &ToolPayload) -> Option<String> {
+    let ToolPayload::Function { arguments } = payload else {
+        return None;
+    };
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    if let Some(input) = value
+        .get("input")
+        .or_else(|| value.get("patch"))
+        .or_else(|| value.get("command"))
+        .and_then(Value::as_str)
+    {
+        return Some(input.to_string());
+    }
+    value.as_str().map(ToString::to_string)
 }
 
 fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) -> String {

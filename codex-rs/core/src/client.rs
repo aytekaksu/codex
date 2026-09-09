@@ -1008,7 +1008,7 @@ impl ModelClient {
         );
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
-        let request = ResponsesApiRequest {
+        let mut request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions,
             input,
@@ -1026,6 +1026,9 @@ impl ModelClient {
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
+        if !is_openai {
+            request.tool_choice = "auto".to_string();
+        }
         Ok(request)
     }
 
@@ -2751,8 +2754,10 @@ fn rewrite_non_openai_response_items(input: &mut Vec<ResponseItem>) {
         } else if matches!(item, ResponseItem::CustomToolCall { .. }) {
             *item = portable_custom_tool_call(std::mem::replace(item, placeholder_user_message()));
         } else if matches!(item, ResponseItem::CustomToolCallOutput { .. }) {
-            *item =
-                portable_custom_tool_call_output(std::mem::replace(item, placeholder_user_message()));
+            *item = portable_custom_tool_call_output(std::mem::replace(
+                item,
+                placeholder_user_message(),
+            ));
         }
     }
 }
@@ -2865,7 +2870,11 @@ fn sanitize_non_openai_tools(
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(tools.get()) else {
         return tools;
     };
-    let changed = truncate_json_tool_names(&mut value) | strip_non_openai_tool_fields(&mut value);
+    let has_web_search = json_contains_web_search(&value);
+    let changed = apply_meta_request_guards(&mut value)
+        | strip_non_openai_tool_fields(&mut value)
+        | apply_meta_tool_name_guards(&mut value, has_web_search)
+        | truncate_json_tool_names(&mut value);
     if !changed {
         return tools;
     }
@@ -2875,10 +2884,97 @@ fn sanitize_non_openai_tools(
     }
 }
 
-fn strip_non_openai_tool_fields(value: &mut serde_json::Value) -> bool {
-    let mut changed = false;
+const META_RESERVED_BROWSER_TOOL_NAMES: [&str; 3] =
+    ["browser.search", "browser.open", "browser.find"];
+
+fn json_contains_web_search(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
+            map.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
+                || map.values().any(json_contains_web_search)
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_contains_web_search),
+        _ => false,
+    }
+}
+
+fn apply_meta_request_guards(value: &mut serde_json::Value) -> bool {
+    let Some(map) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    match map.get("tool_choice") {
+        Some(serde_json::Value::String(choice)) if choice == "auto" => {}
+        Some(_) => {
+            map.insert(
+                "tool_choice".to_string(),
+                serde_json::Value::String("auto".to_string()),
+            );
+            changed = true;
+        }
+        None => {}
+    }
+    match map.get("truncation") {
+        Some(serde_json::Value::String(truncation)) if truncation == "disabled" => {}
+        Some(_) => {
+            map.remove("truncation");
+            changed = true;
+        }
+        None => {}
+    }
+    changed
+}
+
+fn apply_meta_tool_name_guards(value: &mut serde_json::Value, has_web_search: bool) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("function") {
+                if let Some(serde_json::Value::String(name)) = map.get_mut("name") {
+                    if has_web_search && META_RESERVED_BROWSER_TOOL_NAMES.contains(&name.as_str()) {
+                        name.push_str("_tool");
+                        changed = true;
+                    }
+                    changed |= collapse_extra_dots_in_tool_name(name);
+                }
+            }
+            for child in map.values_mut() {
+                changed |= apply_meta_tool_name_guards(child, has_web_search);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for child in items {
+                changed |= apply_meta_tool_name_guards(child, has_web_search);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn collapse_extra_dots_in_tool_name(name: &mut String) -> bool {
+    let Some(first_dot) = name.find('.') else {
+        return false;
+    };
+    let (head, tail) = name.split_at(first_dot + 1);
+    if !tail.contains('.') {
+        return false;
+    }
+    let collapsed = tail.replace('.', "_");
+    *name = format!("{head}{collapsed}");
+    true
+}
+
+fn strip_non_openai_tool_fields(value: &mut serde_json::Value) -> bool {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("custom") {
+        convert_custom_tool_to_function(value);
+        return true;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
             if map.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
                 && map.remove("search_content_types").is_some()
             {
@@ -2887,43 +2983,34 @@ fn strip_non_openai_tool_fields(value: &mut serde_json::Value) -> bool {
             for child in map.values_mut() {
                 changed |= strip_non_openai_tool_fields(child);
             }
+            changed
         }
         serde_json::Value::Array(items) => {
-            let mut next = Vec::with_capacity(items.len());
-            for mut child in std::mem::take(items) {
-                if child.get("type").and_then(serde_json::Value::as_str) == Some("custom") {
-                    if child.get("name").and_then(serde_json::Value::as_str) == Some("apply_patch")
-                    {
-                        convert_apply_patch_custom_tool(&mut child);
-                        changed = true;
-                        next.push(child);
-                    } else {
-                        changed = true;
-                    }
-                    continue;
-                }
-                changed |= strip_non_openai_tool_fields(&mut child);
-                next.push(child);
+            let mut changed = false;
+            for child in items {
+                changed |= strip_non_openai_tool_fields(child);
             }
-            *items = next;
+            changed
         }
-        _ => {}
+        _ => false,
     }
-    changed
 }
 
-fn convert_apply_patch_custom_tool(value: &mut serde_json::Value) {
-    let description = value
-        .get("description")
+fn convert_custom_tool_to_function(value: &mut serde_json::Value) {
+    let name = value
+        .get("name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("The `apply_patch` tool can be used to edit files.")
-        .replace(
-            "This is a FREEFORM tool, so do not wrap the patch in JSON.",
-            "Pass the full apply_patch document in the `input` argument.",
-        );
+        .unwrap_or_default()
+        .to_string();
+    let description = match value.get("description").and_then(serde_json::Value::as_str) {
+        Some(text) if !text.is_empty() => {
+            format!("{text} Pass the freeform text in the `input` argument.")
+        }
+        _ => "Pass the freeform text in the `input` argument.".to_string(),
+    };
     *value = serde_json::json!({
         "type": "function",
-        "name": "apply_patch",
+        "name": name,
         "description": description,
         "strict": false,
         "parameters": {
@@ -2931,7 +3018,7 @@ fn convert_apply_patch_custom_tool(value: &mut serde_json::Value) {
             "properties": {
                 "input": {
                     "type": "string",
-                    "description": "The apply_patch document, including *** Begin Patch and *** End Patch."
+                    "description": "The freeform tool input text."
                 }
             },
             "required": ["input"],

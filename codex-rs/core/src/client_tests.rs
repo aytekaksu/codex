@@ -1403,7 +1403,7 @@ fn non_openai_tools_drop_web_search_content_types() {
     assert_eq!(value[0]["type"], "web_search");
     assert_eq!(
         value[1]["name"],
-        "mcp__codex_apps__sites___create_source_repository_write_creden"
+        "mcp__codex_apps__sites___create_source_repository_write_credenti"
     );
     assert_eq!(value[1]["name"].as_str().unwrap().chars().count(), 64);
 }
@@ -1447,7 +1447,7 @@ fn non_openai_tools_rewrite_custom_apply_patch() {
     let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
     let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
     let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
-    assert_eq!(value.as_array().map(Vec::len), Some(3));
+    assert_eq!(value.as_array().map(Vec::len), Some(4));
     assert_eq!(value[0]["type"], "function");
     assert_eq!(value[1]["type"], "function");
     assert_eq!(value[1]["name"], "apply_patch");
@@ -1459,9 +1459,97 @@ fn non_openai_tools_rewrite_custom_apply_patch() {
             .unwrap()
             .contains("`input` argument")
     );
-    assert_eq!(value[2]["type"], "namespace");
-    assert_eq!(value[2]["tools"].as_array().map(Vec::len), Some(1));
-    assert_eq!(value[2]["tools"][0]["name"], "spawn_agent");
+    assert_eq!(value[2]["type"], "function");
+    assert_eq!(value[2]["name"], "other_custom");
+    assert_eq!(value[2].get("format"), None);
+    assert_eq!(value[2]["parameters"]["required"][0], "input");
+    assert_eq!(value[3]["type"], "namespace");
+    assert_eq!(value[3]["tools"].as_array().map(Vec::len), Some(2));
+    assert_eq!(value[3]["tools"][0]["name"], "spawn_agent");
+    assert_eq!(value[3]["tools"][1]["type"], "function");
+    assert_eq!(value[3]["tools"][1]["name"], "nested_custom");
+    assert_eq!(value[3]["tools"][1].get("format"), None);
+    assert_eq!(value[3]["tools"][1]["parameters"]["required"][0], "input");
+}
+
+#[test]
+fn non_openai_request_forces_tool_choice_auto() {
+    let request = serde_json::json!({
+        "tool_choice": "none",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&request).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value["tool_choice"], "auto");
+}
+
+#[test]
+fn non_openai_request_drops_truncation_unless_disabled() {
+    let request = serde_json::json!({
+        "truncation": "auto",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&request).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value.get("truncation"), None);
+
+    let disabled = serde_json::json!({
+        "truncation": "disabled",
+        "tools": [{ "type": "function", "name": "exec_command" }]
+    });
+    let raw = serde_json::value::to_raw_value(&disabled).expect("request json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value["truncation"], "disabled");
+}
+
+#[test]
+fn non_openai_tools_rename_reserved_browser_names_when_web_search_present() {
+    let tools = serde_json::json!([
+        { "type": "web_search" },
+        { "type": "function", "name": "browser.search" },
+        { "type": "function", "name": "browser.open" },
+        { "type": "function", "name": "browser.find" },
+        { "type": "function", "name": "browser.other" }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[1]["name"], "browser.search_tool");
+    assert_eq!(value[2]["name"], "browser.open_tool");
+    assert_eq!(value[3]["name"], "browser.find_tool");
+    assert_eq!(value[4]["name"], "browser.other");
+
+    let without_search = serde_json::json!([
+        { "type": "function", "name": "browser.search" }
+    ]);
+    let raw = serde_json::value::to_raw_value(&without_search).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[0]["name"], "browser.search");
+}
+
+#[test]
+fn non_openai_tools_collapse_extra_dots_in_names() {
+    let tools = serde_json::json!([
+        { "type": "function", "name": "a.b.c" },
+        { "type": "function", "name": "foo.bar.baz.qux" },
+        { "type": "function", "name": "already.one" },
+        {
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [{ "type": "function", "name": "ns.inner.extra" }]
+        }
+    ]);
+    let raw = serde_json::value::to_raw_value(&tools).expect("tools json");
+    let sanitized = super::sanitize_non_openai_tools(std::sync::Arc::from(raw));
+    let value: serde_json::Value = serde_json::from_str(sanitized.get()).expect("sanitized json");
+    assert_eq!(value[0]["name"], "a.b_c");
+    assert_eq!(value[1]["name"], "foo.bar_baz_qux");
+    assert_eq!(value[2]["name"], "already.one");
+    assert_eq!(value[3]["tools"][0]["name"], "ns.inner_extra");
 }
 
 #[test]
