@@ -8,6 +8,9 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents::collab_tool_call_status;
+use crate::tools::handlers::multi_agents_common::MUSE_SPARK_FULL_HISTORY_FORK_TURNS;
+use crate::tools::handlers::multi_agents_common::infer_muse_spark_role;
+use crate::tools::handlers::multi_agents_common::looks_like_muse_spark_name;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -112,13 +115,24 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let fork_mode = args.fork_mode()?;
+    let inferred_muse_role = infer_muse_spark_role(
+        &args.task_name,
+        args.agent_type.as_deref(),
+        args.model.as_deref(),
+    );
+    let mut fork_mode = args.fork_mode()?;
+    if inferred_muse_role.is_some() && matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
+        fork_mode = Some(SpawnAgentForkMode::LastNTurns(
+            MUSE_SPARK_FULL_HISTORY_FORK_TURNS,
+        ));
+    }
     let message = message_content(args.message)?;
-    let role_name = args
-        .agent_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
+    let role_name = inferred_muse_role.or_else(|| {
+        args.agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+    });
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -129,7 +143,9 @@ async fn handle_spawn_agent(
         &session,
         turn.as_ref(),
         &mut config,
-        args.model.as_deref(),
+        args.model
+            .as_deref()
+            .filter(|model| !looks_like_muse_spark_name(model)),
         args.reasoning_effort.clone(),
     )
     .await?;

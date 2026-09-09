@@ -64,6 +64,33 @@ async fn file_update_mode_follows_preserve_line_endings_feature() {
     );
 }
 
+#[test]
+fn apply_patch_reads_function_arguments() {
+    let patch = sample_patch();
+    assert_eq!(
+        apply_patch_payload_command(&ToolPayload::Function {
+            arguments: json!({ "input": patch }).to_string(),
+        }),
+        Some(patch.to_string())
+    );
+    assert_eq!(
+        apply_patch_payload_command(&ToolPayload::Function {
+            arguments: json!({ "command": patch }).to_string(),
+        }),
+        Some(patch.to_string())
+    );
+    assert_eq!(
+        apply_patch_payload_command(&ToolPayload::Function {
+            arguments: patch.to_string(),
+        }),
+        Some(patch.to_string())
+    );
+    let handler = ApplyPatchHandler::default();
+    assert!(handler.matches_kind(&ToolPayload::Function {
+        arguments: json!({ "input": patch }).to_string(),
+    }));
+}
+
 #[tokio::test]
 async fn pre_tool_use_payload_uses_freeform_patch_input() {
     let patch = sample_patch();
